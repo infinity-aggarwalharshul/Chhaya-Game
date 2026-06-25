@@ -1,0 +1,486 @@
+<!DOCTYPE html> 
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chhaya: The Genie Paradox - Prototype</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; }
+        #game-canvas { display: block; width: 100vw; height: 100vh; }
+        
+        /* UI Overlay Elements */
+        #blocker {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background-color: rgba(0,0,0,0.8); display: flex; flex-direction: column;
+            align-items: center; justify-content: center; color: white; z-index: 10;
+        }
+        #instructions { text-align: center; max-width: 600px; padding: 20px; }
+        
+        #hud {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; display: none; z-index: 5;
+        }
+        
+        /* Crosshair */
+        #crosshair {
+            position: absolute; top: 50%; left: 50%;
+            width: 10px; height: 10px; background: white; border-radius: 50%;
+            transform: translate(-50%, -50%); opacity: 0.5;
+        }
+
+        /* Chhaya Lens Effect Overlay */
+        #lens-overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 255, 0, 0.1);
+            box-shadow: inset 0 0 100px rgba(0,255,0,0.5);
+            pointer-events: none; display: none;
+            mix-blend-mode: color-dodge;
+        }
+
+        /* Battery/Sanity Meter */
+        #battery-container { position: absolute; bottom: 30px; right: 30px; width: 200px; }
+        #battery-label { color: #0f0; font-size: 14px; margin-bottom: 5px; text-shadow: 0 0 5px #0f0; }
+        #battery-bar-bg { width: 100%; height: 10px; background: rgba(0,255,0,0.2); border: 1px solid #0f0; }
+        #battery-bar { width: 100%; height: 100%; background: #0f0; box-shadow: 0 0 10px #0f0; transition: width 0.1s; }
+
+        /* Debug Logs / Subtitles */
+        #debug-log {
+            position: absolute; bottom: 30px; left: 30px; color: #ff3333;
+            max-width: 400px; font-size: 16px; text-shadow: 0 0 5px #f00;
+        }
+        
+        /* Mirror World Effect on Canvas */
+        .mirror-world { filter: invert(1) hue-rotate(180deg); }
+        .lens-active { filter: sepia(1) hue-rotate(90deg) contrast(1.5); }
+    </style>
+</head>
+<body>
+
+    <div id="blocker">
+        <div id="instructions">
+            <h1 class="text-4xl font-bold mb-4 text-red-500 tracking-widest">CHHAYA</h1>
+            <p class="mb-2 text-gray-300">GENIE 3 ENGINE: CORRUPTED</p>
+            <p class="mb-6 text-sm text-gray-400">Context memory failing. Infinite loop detected.</p>
+            <div class="text-left mb-6 space-y-2 bg-gray-900 p-4 rounded border border-gray-700">
+                <p><b>WASD</b> = Move | <b>Mouse</b> = Look</p>
+                <p><b>F</b> = Toggle Chhaya Lens (Reveals Anomalies)</p>
+                <p><b>Click</b> = Interact with Anomaly</p>
+            </div>
+            <button class="px-6 py-3 bg-red-800 hover:bg-red-600 text-white font-bold rounded shadow-lg shadow-red-500/50 transition-all">
+                ENTER SIMULATION
+            </button>
+        </div>
+    </div>
+
+    <div id="hud">
+        <div id="crosshair"></div>
+        <div id="lens-overlay"></div>
+        <div id="battery-container">
+            <div id="battery-label">LENS SANITY</div>
+            <div id="battery-bar-bg"><div id="battery-bar"></div></div>
+        </div>
+        <div id="debug-log"></div>
+    </div>
+
+    <canvas id="game-canvas"></canvas>
+
+    <!-- Import Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        let camera, scene, renderer, controls;
+        let objects = [];
+        let raycaster;
+        let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
+        let prevTime = performance.now();
+        const velocity = new THREE.Vector3();
+        const direction = new THREE.Vector3();
+        
+        // Game State
+        let loopCount = 0;
+        const HALLWAY_LENGTH = 100;
+        let isLensActive = false;
+        let lensBattery = 100;
+        let anomalyObject = null;
+        let inMirrorWorld = false;
+
+        // Audio Context (Procedural Web Audio)
+        let audioCtx, droneOsc, noiseNode, gainNode;
+
+        const blocker = document.getElementById('blocker');
+        const instructions = document.getElementById('instructions');
+        const hud = document.getElementById('hud');
+        const batteryBar = document.getElementById('battery-bar');
+        const debugLog = document.getElementById('debug-log');
+        const gameCanvas = document.getElementById('game-canvas');
+        const lensOverlay = document.getElementById('lens-overlay');
+
+        // Simplified PointerLockControls implementation since we can't reliably load external modules in a single file without module maps
+        class SimplePointerLockControls {
+            constructor(camera, domElement) {
+                this.camera = camera;
+                this.domElement = domElement;
+                this.isLocked = false;
+                this.euler = new THREE.Euler(0, 0, 0, 'YXZ');
+                this.PI_2 = Math.PI / 2;
+
+                this.onMouseMove = this.onMouseMove.bind(this);
+                this.onPointerlockChange = this.onPointerlockChange.bind(this);
+
+                document.addEventListener('pointerlockchange', this.onPointerlockChange, false);
+            }
+
+            onMouseMove(event) {
+                if (this.isLocked === false) return;
+                const movementX = event.movementX || event.mozMovementX || event.webkitMovementX || 0;
+                const movementY = event.movementY || event.mozMovementY || event.webkitMovementY || 0;
+                
+                this.euler.setFromQuaternion(this.camera.quaternion);
+                this.euler.y -= movementX * 0.002;
+                this.euler.x -= movementY * 0.002;
+                this.euler.x = Math.max(-this.PI_2, Math.min(this.PI_2, this.euler.x));
+                this.camera.quaternion.setFromEuler(this.euler);
+            }
+
+            onPointerlockChange() {
+                if (document.pointerLockElement === this.domElement) {
+                    this.isLocked = true;
+                    document.addEventListener('mousemove', this.onMouseMove, false);
+                } else {
+                    this.isLocked = false;
+                    document.removeEventListener('mousemove', this.onMouseMove, false);
+                    blocker.style.display = 'flex';
+                    hud.style.display = 'none';
+                }
+            }
+
+            lock() { this.domElement.requestPointerLock(); }
+            unlock() { document.exitPointerLock(); }
+            getObject() { return this.camera; }
+        }
+
+        init();
+        animate();
+
+        function init() {
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 1000);
+            camera.position.y = 10;
+            camera.position.z = 0; // Start position
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x0a0505);
+            scene.fog = new THREE.Fog(0x0a0505, 10, 80); // Creepy fog masking the loop
+
+            const light = new THREE.HemisphereLight(0xeeeeff, 0x777788, 0.1);
+            light.position.set(0.5, 1, 0.75);
+            scene.add(light);
+
+            controls = new SimplePointerLockControls(camera, document.body);
+
+            instructions.addEventListener('click', function () {
+                controls.lock();
+                initAudio();
+                blocker.style.display = 'none';
+                hud.style.display = 'block';
+                showDebugLog("Engine initialized. Memory stable.");
+            });
+
+            scene.add(controls.getObject());
+
+            // Key Bindings
+            const onKeyDown = function (event) {
+                switch (event.code) {
+                    case 'ArrowUp':
+                    case 'KeyW': moveForward = true; break;
+                    case 'ArrowLeft':
+                    case 'KeyA': moveLeft = true; break;
+                    case 'ArrowDown':
+                    case 'KeyS': moveBackward = true; break;
+                    case 'ArrowRight':
+                    case 'KeyD': moveRight = true; break;
+                    case 'KeyF': toggleLens(); break;
+                }
+            };
+
+            const onKeyUp = function (event) {
+                switch (event.code) {
+                    case 'ArrowUp':
+                    case 'KeyW': moveForward = false; break;
+                    case 'ArrowLeft':
+                    case 'KeyA': moveLeft = false; break;
+                    case 'ArrowDown':
+                    case 'KeyS': moveBackward = false; break;
+                    case 'ArrowRight':
+                    case 'KeyD': moveRight = false; break;
+                }
+            };
+
+            document.addEventListener('keydown', onKeyDown);
+            document.addEventListener('keyup', onKeyUp);
+            document.addEventListener('mousedown', onMouseClick);
+
+            raycaster = new THREE.Raycaster();
+
+            // Build Environment
+            buildRajasthaniHallway();
+            spawnAnomaly();
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ canvas: gameCanvas, antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function buildRajasthaniHallway() {
+            // Floor
+            const floorGeo = new THREE.PlaneGeometry(50, HALLWAY_LENGTH * 3);
+            const floorMat = new THREE.MeshLambertMaterial({ color: 0x3d2b1f }); // Dark sandstone
+            const floor = new THREE.Mesh(floorGeo, floorMat);
+            floor.rotation.x = -Math.PI / 2;
+            scene.add(floor);
+
+            // Ceiling
+            const ceilGeo = new THREE.PlaneGeometry(50, HALLWAY_LENGTH * 3);
+            const ceilMat = new THREE.MeshLambertMaterial({ color: 0x1a110a });
+            const ceil = new THREE.Mesh(ceilGeo, ceilMat);
+            ceil.rotation.x = Math.PI / 2;
+            ceil.position.y = 30;
+            scene.add(ceil);
+
+            // Procedural Arches and Pillars
+            const archCount = 15;
+            for(let i=0; i<archCount; i++) {
+                let zPos = -(i * 20) + 50;
+
+                // Pillars
+                const pillarGeo = new THREE.CylinderGeometry(2, 2, 30, 8);
+                const pillarMat = new THREE.MeshLambertMaterial({ color: 0x5c4033 }); // Sandstone
+                
+                let pLeft = new THREE.Mesh(pillarGeo, pillarMat);
+                pLeft.position.set(-20, 15, zPos);
+                scene.add(pLeft);
+                objects.push(pLeft); // for collision/raycasting
+
+                let pRight = new THREE.Mesh(pillarGeo, pillarMat);
+                pRight.position.set(20, 15, zPos);
+                scene.add(pRight);
+                objects.push(pRight);
+
+                // Arches (Torus halves)
+                const archGeo = new THREE.TorusGeometry(20, 2, 8, 24, Math.PI);
+                const arch = new THREE.Mesh(archGeo, pillarMat);
+                arch.position.set(0, 30, zPos);
+                scene.add(arch);
+
+                // Torches (Point Lights)
+                if(i % 2 === 0) {
+                    const torchLight = new THREE.PointLight(0xffaa00, 1, 40);
+                    torchLight.position.set(-18, 15, zPos);
+                    scene.add(torchLight);
+
+                    const torchLight2 = new THREE.PointLight(0xffaa00, 1, 40);
+                    torchLight2.position.set(18, 15, zPos);
+                    scene.add(torchLight2);
+                }
+            }
+        }
+
+        function spawnAnomaly() {
+            // The anomaly is a modern, digital construct hidden in the ancient world
+            const geo = new THREE.BoxGeometry(4, 4, 4);
+            const mat = new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true, transparent: true, opacity: 0.1 });
+            anomalyObject = new THREE.Mesh(geo, mat);
+            
+            // Place it behind a random pillar down the hall
+            const randomZ = -(Math.random() * 100 + 50);
+            anomalyObject.position.set(15, 10, randomZ);
+            anomalyObject.userData = { isAnomaly: true };
+            scene.add(anomalyObject);
+            objects.push(anomalyObject);
+        }
+
+        function toggleLens() {
+            if(inMirrorWorld) return; // Lens breaks in mirror world
+            
+            isLensActive = !isLensActive;
+            if(isLensActive) {
+                if(lensBattery <= 0) {
+                    isLensActive = false;
+                    showDebugLog("WARNING: Chhaya Lens Battery Depleted.");
+                    return;
+                }
+                gameCanvas.classList.add('lens-active');
+                lensOverlay.style.display = 'block';
+                if(anomalyObject) anomalyObject.material.opacity = 1.0; // Reveal anomaly
+                playGlitchSound();
+            } else {
+                gameCanvas.classList.remove('lens-active');
+                lensOverlay.style.display = 'none';
+                if(anomalyObject) anomalyObject.material.opacity = 0.1; // Hide anomaly
+            }
+        }
+
+        function initAudio() {
+            if(audioCtx) return;
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            
+            // Dark Drone
+            droneOsc = audioCtx.createOscillator();
+            droneOsc.type = 'sine';
+            droneOsc.frequency.setValueAtTime(50, audioCtx.currentTime); // Low bass drone
+            
+            gainNode = audioCtx.createGain();
+            gainNode.gain.setValueAtTime(0.5, audioCtx.currentTime);
+            
+            droneOsc.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+            droneOsc.start();
+        }
+
+        function playGlitchSound() {
+            if(!audioCtx) return;
+            const bufferSize = audioCtx.sampleRate * 0.2; // 0.2 seconds of noise
+            const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) {
+                data[i] = Math.random() * 2 - 1;
+            }
+            
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = buffer;
+            
+            const noiseFilter = audioCtx.createBiquadFilter();
+            noiseFilter.type = 'bandpass';
+            noiseFilter.frequency.value = 1000 + Math.random() * 2000;
+            
+            noise.connect(noiseFilter);
+            noiseFilter.connect(audioCtx.destination);
+            noise.start();
+        }
+
+        function updateAudioDegradation() {
+            if(!audioCtx || !droneOsc) return;
+            // Lower frequency and increase distortion as loops increase
+            droneOsc.frequency.setTargetAtTime(50 - (loopCount * 5), audioCtx.currentTime, 0.5);
+            if(Math.random() < loopCount * 0.01) {
+                playGlitchSound();
+            }
+        }
+
+        function onMouseClick() {
+            if (!controls.isLocked) return;
+
+            raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+            const intersects = raycaster.intersectObjects(objects);
+
+            if (intersects.length > 0) {
+                const object = intersects[0].object;
+                if (object.userData.isAnomaly && intersects[0].distance < 30) {
+                    triggerMirrorWorld();
+                }
+            }
+        }
+
+        function triggerMirrorWorld() {
+            inMirrorWorld = true;
+            isLensActive = false;
+            gameCanvas.classList.remove('lens-active');
+            lensOverlay.style.display = 'none';
+            
+            // World Transformation Checkpoint
+            gameCanvas.classList.add('mirror-world');
+            scene.fog.color.setHex(0xffffff); // Invert fog
+            scene.background.setHex(0xffffff);
+            
+            if(anomalyObject) scene.remove(anomalyObject);
+
+            showDebugLog("CHECKPOINT REACHED. NLP Override Accepted. World state transitioning...");
+            playGlitchSound();
+            playGlitchSound();
+            
+            if(droneOsc) droneOsc.frequency.setTargetAtTime(200, audioCtx.currentTime, 0.1); // High pitch ring
+        }
+
+        function showDebugLog(msg) {
+            debugLog.innerText = `> ${msg}`;
+            setTimeout(() => { debugLog.innerText = ''; }, 5000);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const time = performance.now();
+
+            if (controls.isLocked === true) {
+                const delta = (time - prevTime) / 1000;
+
+                velocity.x -= velocity.x * 10.0 * delta;
+                velocity.z -= velocity.z * 10.0 * delta;
+
+                direction.z = Number(moveForward) - Number(moveBackward);
+                direction.x = Number(moveRight) - Number(moveLeft);
+                direction.normalize();
+
+                if (moveForward || moveBackward) velocity.z -= direction.z * 400.0 * delta;
+                if (moveLeft || moveRight) velocity.x -= direction.x * 400.0 * delta;
+
+                controls.getObject().translateX(velocity.x * delta);
+                controls.getObject().translateZ(velocity.z * delta);
+
+                // Collision bounds to keep in hallway
+                if(camera.position.x > 15) camera.position.x = 15;
+                if(camera.position.x < -15) camera.position.x = -15;
+
+                // --- THE CONTEXT FRACTURE LOOP LOGIC ---
+                // If player walks past Z = -200, teleport them back to Z = 0 seamlessly
+                if (camera.position.z < -200 && !inMirrorWorld) {
+                    camera.position.z += 200; 
+                    loopCount++;
+                    
+                    // Machine Learning Logic simulation
+                    scene.fog.near = Math.max(1, 10 - loopCount * 2); // Fog gets closer
+                    updateAudioDegradation();
+                    
+                    if(loopCount === 2) {
+                        showDebugLog("Warning: Context memory repeating. Degration 20%.");
+                    } else if (loopCount === 4) {
+                        showDebugLog("Director AI Tip: Use Chhaya Lens [F] to spot digital anomalies.");
+                        playGlitchSound();
+                    }
+                }
+
+                // Lens Battery logic
+                if(isLensActive) {
+                    lensBattery -= 10 * delta; // Drain battery
+                    batteryBar.style.width = Math.max(0, lensBattery) + '%';
+                    if(lensBattery <= 0) {
+                        toggleLens(); // Auto turn off
+                    }
+                } else if(lensBattery < 100 && !inMirrorWorld) {
+                    lensBattery += 2 * delta; // Slow recharge
+                    batteryBar.style.width = lensBattery + '%';
+                }
+
+                // Anomaly floating animation
+                if(anomalyObject) {
+                    anomalyObject.rotation.x += 1 * delta;
+                    anomalyObject.rotation.y += 2 * delta;
+                    anomalyObject.position.y = 10 + Math.sin(time * 0.005) * 2;
+                }
+            }
+
+            prevTime = time;
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+    </script>
+</body>
+</html>
